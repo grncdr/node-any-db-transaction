@@ -1,38 +1,94 @@
 # any-db-transaction
 
-*note:* Generally you will not want to use this package directly, it is primarily
-intended to simplify writing an Any-DB adapter that supports transactions.
+## Synopsis
 
-## Description
+```javascript
+var anyDB = require('any-db')
+var begin = require('any-db-transaction')
 
-Transaction objects are created by [Connection.begin][] and [Pool.begin][]. They
-are simple wrappers around a [Connection][] that implement the same API, but
-ensure that all queries take place within a single database transaction.
+var connection = anyDB.createConnection(...)
+var pool = anyDB.createPool(...)
 
-Any queries that error during a transaction will cause an automatic rollback. If
-a query has no callback, the transaction will also handle (and re-emit)
-`'error'` events for that query. This enables handling errors for an entire
-transaction in a single place.
+// Callback-style
+begin(connection, function (err, transaction) {
+	if (err) return console.error(err)
+	// Do work using transaction
+  transaction.query(...)
+  transaction.commit()
+})
 
-Transactions also implement their own [begin method][] for creating nested
-transactions using savepoints. Nested transaction can safely error and rollback
-without rolling back their parent transaction.
+// Synchronous-style*
+var transaction = begin(connection)
+transaction.on('error', console.error)
+transaction.query(...)
+transaction.commit()
+
+// Or use a connection pool
+var transaction = begin(pool)
+```
 
 ## API
 
 ```ocaml
-Transaction := StateMachine & {
-  adapter:  String
-  query:    (String, Array?, Continuation<ResultSet>) => Query
-  begin:    (String?, Continuation<Transaction>) => Transaction
+module.exports := begin(Queryable, statement: String?, Continuation<Transaction>?) => Transaction
+
+Transaction := FSM & Queryable & {
   commit:   (Continuation?) => void
   rollback: (Continuation?) => void
 }
 ```
 
-### Transaction.adapter
+### begin
 
-Contains the adapter name used for the transaction, e.g. `'sqlite3'`, etc.
+```ocaml
+module.exports := begin(Queryable, statement: String?, Continuation<Transaction>?) => Transaction
+```
+
+Transaction objects are are simple wrappers around a [Connection][] that also
+implement the [Queryable][] API, but guarantee that all queries take place
+within a single database transaction or not at all. Note that `begin` also
+understands how to acquire (and release) a connection from a [ConnectionPool][]
+as well, so you can simply pass a pool to it: `var tx = begin(pool)`
+
+Any queries that error during a transaction will cause an automatic rollback.
+If a query has no callback, the transaction will also handle (and re-emit)
+`'error'` events for the [Query][] instance. This enables handling errors for
+an entire transaction in a single place.
+
+Transactions may also be nested by passing a `Transaction` to `begin` and these
+nested transactions can safely error and rollback without rolling back their
+parent transaction:
+
+```javascript
+var parent = begin(connection)
+var child = begin(parent)
+child.query("some invalid sql")
+child.on('error', function () {
+  parent.query("select 1") // parent still works
+})
+```
+
+This feature relies on the `SAVEPOINT` support in your database. (In particular
+MySQL will doesn't have good support in very old versions). The use of
+savepoints also means there is no option to replace the statement used to begin
+the child transaction.
+
+While the child transaction is in progress the parent transaction will queue any
+queries it receives until the child transaction either commits or rolls back, at
+which point it will process the queue. Be careful: it's quite possible to write
+code that deadlocks by waiting for a query in the parent transaction before
+committing the child transaction. For example:
+
+```javascript
+// Do not do this! it will deadlock!
+
+var parent = begin(connection) // starts the transaction
+var child  = begin(parent)     // creates a savepoint
+
+parent.query('SELECT 1', function (err) {
+  child.commit();
+});
+```
 
 ### Transaction states
 
@@ -65,13 +121,13 @@ errors. (The errors will either be sent to any callback provided or emitted as
 `error` events on the next tick).
 
 In the `open` state, all database operations will be performed immediately. If
-a child transaction is started with [Transaction.begin][], the parent
+a child transaction is started like `var child = begin(parentTxn)`, the parent
 transaction will move back into the `connected` state (queueing any queries it
 receives) until the child completes, at which point it will resume processing
 it's own internal queue.
 
-*\ * - Transactions started from [Connection.begin][] transition
-to `connected` before the transaction is returned from `.begin`.*
+Transactions created from a [Connection][] transition to `connected` before
+[begin][] returns.
 
 ### Transaction.query
 
@@ -79,9 +135,10 @@ to `connected` before the transaction is returned from `.begin`.*
 (text: String, params: Array?, Continuation<Result>?) => Query
 ```
 
-Acts exactly like [Connection.query][] except queries are
-guaranteed to be performed within the transaction. If the transaction has been
-committed or rolled back further calls to `query` will fail.
+Maintains the same contract as [Queryable.query][] but adds further guarantees
+that queries will be performed within the transaction or not at all. If the
+transaction has been committed or rolled back this method will fail by passing
+an error to the continuation (if provided) or emitting an `'error'` event.
 
 ### Transaction.commit
 
@@ -90,9 +147,9 @@ committed or rolled back further calls to `query` will fail.
 ```
 
 Issue a `COMMIT` (or `RELEASE ...` in the case of nested transactions) statement
-to the database. If a callback is given it will be called with any errors after
-the `COMMIT` statement completes. The transaction object itself will be unusable
-after calling `commit()`.
+to the database. If a continuation is provided it will be called (possibly with
+an error) after the `COMMIT` statement completes. The transaction object itself
+will be unusable after calling `commit()`.
 
 ### Transaction.rollback
 
@@ -102,34 +159,6 @@ after calling `commit()`.
 
 The same as [Transaction.commit](#transactioncommit) but issues a `ROLLBACK`.
 Again, the transaction will be unusable after calling this method.
-
-### Transaction.begin
-
-`(Continuation<void>) => void`
-
-Starts a nested transaction (by creating a savepoint) within this transaction
-and returns a new transaction object. Unlike [Connection.begin][], there is no
-option to replace the statement used to begin the transaction, this is because
-the statement must use a known savepoint name.
-
-While the child transaction is in progress the parent transaction will queue any
-queries it receives until the child transaction either commits or rolls back, at
-which point it will process the queue. Be careful: it's quite possible to write
-code that deadlocks by waiting for a query in the parent transaction before
-committing the child transaction. For example:
-
-    // Do not do this! it won't work!
-
-    var parent = conn.begin();  // starts the transaction
-    var child = parent.begin(); // creates a savepoint
-
-    parent.query('SELECT 1', function (err) {
-      child.commit();
-    });
-
-### Transaction.adapter
-
-Contains the adapter name used for this transaction, e.g. `'sqlite3'`, etc.
 
 ### Transaction events
 
@@ -157,8 +186,9 @@ external abuse-monitoring service, and flag or delete users as necessary, if
 for any reason we only get part way through, the entire transaction is rolled
 back and nobody is flagged or deleted:
 
-	var tx = pool.begin()
+  var pool = require('any-db').createPool(...)
 
+	var tx = begin(pool)
 	tx.on('error', finished)
 
 	/*
@@ -191,3 +221,10 @@ back and nobody is flagged or deleted:
 # License
 
 2-clause BSD
+
+[begin]: #begin
+[Connection]: https://github.com/grncdr/any-db-adapter-spec#connection
+[Queryable]: https://github.com/grncdr/any-db-adapter-spec#queryable
+[Queryable.query]: https://github.com/grncdr/any-db-adapter-spec#queryablequery
+[Query]: https://github.com/grncdr/any-db-adapter-spec#query
+[ConnectionPool]: https://github.com/grncdr/any-db-pool#connectionpool
